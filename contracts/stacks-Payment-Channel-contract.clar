@@ -110,3 +110,61 @@
     signature: (buff 65)
   }
 )
+;; Initialize the contract
+(define-public (initialize)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    
+    ;; Initialize default settings
+    (var-set dispute-timeout u1440)
+    (var-set settle-timeout u144)
+    (var-set protocol-fee-percentage u20)
+    
+    (ok true)
+  )
+)
+
+;; Register as network participant
+(define-public (register-participant)
+  (let (
+    (participant tx-sender)
+    (existing-record (map-get? participants { participant: participant }))
+  )
+    (asserts! (is-none existing-record) err-already-registered)
+    
+    ;; Add to participant registry
+    (map-set participants
+      { participant: participant }
+      {
+        active: true,
+        total-channels: u0,
+        total-capacity: u0,
+        reputation-score: u70, ;; Start with neutral reputation
+        last-active: block-height
+      }
+    )
+    
+    ;; Add to participant list
+    (var-set network-participants (append (var-get network-participants) participant))
+    
+    (ok true)
+  )
+)
+
+;; Deregister from network
+(define-public (deregister-participant)
+  (let (
+    (participant tx-sender)
+    (existing-record (map-get? participants { participant: participant }))
+  )
+    (asserts! (is-some existing-record) err-not-registered)
+    
+    ;; Note: Don't actually delete, just mark as inactive
+    (map-set participants
+      { participant: participant }
+      (merge (unwrap-panic existing-record) { active: false })
+    )
+    
+    (ok true)
+  )
+)
