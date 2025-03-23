@@ -460,3 +460,564 @@
     (ok { dispute-end-block: (+ block-height (var-get dispute-timeout)) })
   )
 )
+;; Update channel during dispute period
+(define-public (update-channel-in-dispute 
+  (channel-id uint)
+  (balance uint)
+  (nonce uint)
+  (signature (buff 65)))
+  
+  (let (
+    (participant tx-sender)
+    (channel (unwrap! (map-get? channels { channel-id: channel-id }) err-channel-not-found))
+    (participant1 (get participant1 channel))
+    (participant2 (get participant2 channel))
+    (is-participant1 (is-eq participant participant1))
+    (is-participant2 (is-eq participant participant2))
+    (settle-block (unwrap! (get settle-block channel) err-invalid-state))
+  )
+    ;; Ensure channel is in closing state
+    (asserts! (is-eq (get state channel) u1) err-invalid-state)
+    
+    ;; Ensure participant is authorized
+    (asserts! (or is-participant1 is-participant2) err-not-authorized)
+    
+    ;; Ensure dispute period hasn't ended
+    (asserts! (< block-height settle-block) err-timelock-not-expired)
+    
+    ;; Get counterparty and nonce
+    (let (
+      (counterparty (if is-participant1 participant2 participant1))
+      (current-nonce (if is-participant1 (get participant2-nonce channel) (get participant1-nonce channel)))
+    )
+      ;; Ensure nonce is higher than current
+      (asserts! (> nonce current-nonce) err-invalid-balance-proof)
+      
+      ;; Validate signature
+      ;; For simplicity, actual signature verification is skipped
+      
+      ;; Update balance proofs
+      (map-set balance-proofs
+        { channel-id: channel-id, participant: counterparty }
+        {
+          nonce: nonce,
+          balance: balance,
+          signature: signature
+        }
+      )
+      
+      ;; Update channel state
+      (map-set channels
+        { channel-id: channel-id }
+        (merge channel 
+          (if is-participant1
+            { participant2-nonce: nonce }
+            { participant1-nonce: nonce }
+          )
+        )
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+;; Settle channel after dispute period
+(define-public (settle-channel (channel-id uint))
+  (let (
+    (channel (unwrap! (map-get? channels { channel-id: channel-id }) err-channel-not-found))
+    (participant1 (get participant1 channel))
+    (participant2 (get participant2 channel))
+    (capacity (get capacity channel))
+    (settle-block (unwrap! (get settle-block channel) err-invalid-state))
+  )
+    ;; Ensure channel is in closing state
+    (asserts! (is-eq (get state channel) u1) err-invalid-state)
+    
+    ;; Ensure dispute period has ended
+    (asserts! (>= block-height settle-block) err-timelock-not-expired)
+    
+    ;; Get final balances from most recent balance proofs
+    (let (
+      (proof1 (map-get? balance-proofs { channel-id: channel-id, participant: participant1 }))
+      (proof2 (map-get? balance-proofs { channel-id: channel-id, participant: participant2 }))
+      (balance1 (if (is-some proof1) (get balance (unwrap-panic proof1)) (get participant1-balance channel)))
+      (balance2 (if (is-some proof2) (get balance (unwrap-panic proof2)) (get participant2-balance channel)))
+      (adjusted-balance1 (if (> (+ balance1 balance2) capacity) 
+                           (* balance1 (/ capacity (+ balance1 balance2)))
+                           balance1))
+      (adjusted-balance2 (- capacity adjusted-balance1))
+    )
+      ;; Transfer balances to participants
+      (as-contract (try! (stx-transfer? adjusted-balance1 (as-contract tx-sender) participant1)))
+      (as-contract (try! (stx-transfer? adjusted-balance2 (as-contract tx-sender) participant2)))
+      
+      ;; Update channel state
+      (map-set channels
+        { channel-id: channel-id }
+        (merge channel {
+          state: u2,  ;; Settled
+          participant1-balance: u0,
+          participant2-balance: u0,
+          capacity: u0,
+          settle-block: (some block-height)
+        })
+      )
+      
+      ;; Update participant metrics
+      (update-participant-metrics participant1 false adjusted-balance1)
+      (update-participant-metrics participant2 false adjusted-balance2)
+      
+      ;; Remove from routing table
+      (map-delete routing-edges { from: participant1, to: participant2 })
+      (map-delete routing-edges { from: participant2, to: participant1 })
+      
+      (ok { 
+        participant1-balance: adjusted-balance1, 
+        participant2-balance: adjusted-balance2 
+      })
+    )
+  )
+)
+
+;; Create a Hashed Time-Locked Contract (HTLC) for multi-hop payments
+(define-public (create-htlc 
+  (channel-id uint)
+  (receiver principal)
+  (amount uint)
+  (hashlock (buff 32))
+  (timelock uint))
+  
+  (let (
+    (sender tx-sender)
+    (htlc-id (var-get next-htlc-id))
+    (channel (unwrap! (map-get? channels { channel-id: channel-id }) err-channel-not-found))
+    (participant1 (get participant1 channel))
+    (participant2 (get participant2 channel))
+    (is-participant1 (is-eq sender participant1))
+    (is-participant2 (is-eq sender participant2))
+  )
+    ;; Ensure channel is open
+    (asserts! (is-eq (get state channel) u0) err-channel-closed)
+    
+    ;; Ensure sender is a channel participant
+    (asserts! (or is-participant1 is-participant2) err-not-authorized)
+    
+    ;; Ensure receiver is the other channel participant
+    (asserts! (if is-participant1 
+               (is-eq receiver participant2)
+               (is-eq receiver participant1)) 
+             err-not-authorized)
+    
+    ;; Ensure sender has sufficient funds
+    (asserts! (if is-participant1
+               (>= (get participant1-balance channel) amount)
+               (>= (get participant2-balance channel) amount))
+             err-insufficient-funds)
+    
+    ;; Ensure timelock is reasonable
+    (asserts! (> timelock block-height) err-invalid-parameters)
+    
+    ;; Create HTLC
+    (map-set htlcs
+      { htlc-id: htlc-id }
+      {
+        channel-id: channel-id,
+        sender: sender,
+        receiver: receiver,
+        amount: amount,
+        hashlock: hashlock,
+        timelock: timelock,
+        preimage: none,
+        claimed: false,
+        refunded: false,
+        created-at: block-height
+      }
+    )
+    
+    ;; Update sender balance (lock the funds)
+    (map-set channels
+      { channel-id: channel-id }
+      (merge channel 
+        (if is-participant1
+          { participant1-balance: (- (get participant1-balance channel) amount) }
+          { participant2-balance: (- (get participant2-balance channel) amount) }
+        )
+      )
+    )
+    
+    ;; Increment HTLC ID
+    (var-set next-htlc-id (+ htlc-id u1))
+    
+    (ok htlc-id)
+  )
+)
+
+;; Fulfill an HTLC with a preimage
+(define-public (fulfill-htlc (htlc-id uint) (preimage (buff 32)))
+  (let (
+    (receiver tx-sender)
+    (htlc (unwrap! (map-get? htlcs { htlc-id: htlc-id }) err-htlc-expired))
+    (channel-id (get channel-id htlc))
+    (channel (unwrap! (map-get? channels { channel-id: channel-id }) err-channel-not-found))
+  )
+    ;; Ensure HTLC hasn't been claimed or refunded
+    (asserts! (not (get claimed htlc)) err-invalid-state)
+    (asserts! (not (get refunded htlc)) err-invalid-state)
+    
+    ;; Ensure timelock hasn't expired
+    (asserts! (< block-height (get timelock htlc)) err-htlc-expired)
+    
+    ;; Ensure receiver is claiming
+    (asserts! (is-eq receiver (get receiver htlc)) err-not-authorized)
+    
+    ;; Verify preimage hashes to hashlock
+    (asserts! (is-eq (sha256 preimage) (get hashlock htlc)) err-incorrect-preimage)
+    
+    ;; Credit receiver
+    (let (
+      (amount (get amount htlc))
+      (participant1 (get participant1 channel))
+      (participant2 (get participant2 channel))
+      (is-receiver-participant1 (is-eq receiver participant1))
+    )
+      ;; Update receiver balance
+      (map-set channels
+        { channel-id: channel-id }
+        (merge channel 
+          (if is-receiver-participant1
+            { participant1-balance: (+ (get participant1-balance channel) amount) }
+            { participant2-balance: (+ (get participant2-balance channel) amount) }
+          )
+        )
+      )
+      
+      ;; Update HTLC
+      (map-set htlcs
+        { htlc-id: htlc-id }
+        (merge htlc {
+          preimage: (some preimage),
+          claimed: true
+        })
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+;; Refund expired HTLC
+(define-public (refund-htlc (htlc-id uint))
+  (let (
+    (sender tx-sender)
+    (htlc (unwrap! (map-get? htlcs { htlc-id: htlc-id }) err-htlc-expired))
+    (channel-id (get channel-id htlc))
+    (channel (unwrap! (map-get? channels { channel-id: channel-id }) err-channel-not-found))
+  )
+    ;; Ensure HTLC hasn't been claimed or refunded
+    (asserts! (not (get claimed htlc)) err-invalid-state)
+    (asserts! (not (get refunded htlc)) err-invalid-state)
+    
+    ;; Ensure timelock has expired
+    (asserts! (>= block-height (get timelock htlc)) err-timelock-not-expired)
+    
+    ;; Ensure sender is requesting refund
+    (asserts! (is-eq sender (get sender htlc)) err-not-authorized)
+    
+    ;; Refund sender
+    (let (
+      (amount (get amount htlc))
+      (participant1 (get participant1 channel))
+      (participant2 (get participant2 channel))
+      (is-sender-participant1 (is-eq sender participant1))
+    )
+      ;; Update sender balance
+      (map-set channels
+        { channel-id: channel-id }
+        (merge channel 
+          (if is-sender-participant1
+            { participant1-balance: (+ (get participant1-balance channel) amount) }
+            { participant2-balance: (+ (get participant2-balance channel) amount) }
+          )
+        )
+      )
+      
+      ;; Update HTLC
+      (map-set htlcs
+        { htlc-id: htlc-id }
+        (merge htlc { refunded: true })
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+;; Add funds to an existing channel
+(define-public (add-funds (channel-id uint) (amount uint))
+  (let (
+    (participant tx-sender)
+    (channel (unwrap! (map-get? channels { channel-id: channel-id }) err-channel-not-found))
+    (participant1 (get participant1 channel))
+    (participant2 (get participant2 channel))
+    (is-participant1 (is-eq participant participant1))
+    (is-participant2 (is-eq participant participant2))
+  )
+    ;; Ensure channel is open
+    (asserts! (is-eq (get state channel) u0) err-channel-closed)
+    
+    ;; Ensure participant is authorized
+    (asserts! (or is-participant1 is-participant2) err-not-authorized)
+    
+    ;; Ensure amount is reasonable
+    (asserts! (> amount u0) err-invalid-amount)
+    
+    ;; Transfer funds
+    (try! (stx-transfer? amount participant (as-contract tx-sender)))
+    
+    ;; Update channel
+    (map-set channels
+      { channel-id: channel-id }
+      (merge channel {
+        capacity: (+ (get capacity channel) amount),
+        participant1-balance: (+ (get participant1-balance channel) (if is-participant1 amount u0)),
+        participant2-balance: (+ (get participant2-balance channel) (if is-participant2 amount u0))
+      })
+    )
+    
+    ;; Update participant metrics
+    (update-participant-metrics participant true amount)
+    
+        ;; Update routing edges
+    (if is-participant1
+      (map-set routing-edges
+        { from: participant1, to: participant2 }
+        (merge 
+          (unwrap-panic (map-get? routing-edges { from: participant1, to: participant2 }))
+          { 
+            capacity: (+ (get capacity channel) amount),
+            last-updated: block-height
+          }
+        )
+      )
+      (map-set routing-edges
+        { from: participant2, to: participant1 }
+        (merge 
+          (unwrap-panic (map-get? routing-edges { from: participant2, to: participant1 }))
+          { 
+            capacity: (+ (get capacity channel) amount),
+            last-updated: block-height
+          }
+        )
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Find a payment route (simplified version, in practice would use a more complex routing algorithm)
+(define-public (find-payment-route (sender principal) (receiver principal) (amount uint))
+  (let (
+    (direct-channel (map-get? participant-channels { participant1: sender, participant2: receiver }))
+  )
+    (if (is-some direct-channel)
+      ;; Direct channel exists, check capacity
+      (let (
+        (channel-id (get channel-id (unwrap-panic direct-channel)))
+        (channel (unwrap-panic (map-get? channels { channel-id: channel-id })))
+        (sender-balance (if (is-eq sender (get participant1 channel))
+                           (get participant1-balance channel)
+                           (get participant2-balance channel)))
+      )
+        (if (>= sender-balance amount)
+          (ok (list channel-id)) ;; Direct route available
+          (err err-insufficient-funds)
+        )
+      )
+      ;; Need to find an indirect route (only 1-hop for simplicity)
+      (find-indirect-route sender receiver amount)
+    )
+  )
+)
+
+;; Helper to find indirect routes via intermediaries
+(define-private (find-indirect-route (sender principal) (receiver principal) (amount uint))
+  (let (
+    (participants (var-get network-participants))
+    (potential-routes (filter-potential-intermediaries participants sender receiver amount))
+  )
+    (if (> (len potential-routes) u0)
+      (ok (unwrap-panic (element-at potential-routes u0)))
+      (err err-route-not-found)
+    )
+  )
+)
+
+;; Helper to filter potential intermediaries for routing
+(define-private (filter-potential-intermediaries 
+  (participants (list 1000 principal))
+  (sender principal)
+  (receiver principal)
+  (amount uint))
+  
+  (let (
+    (intermediaries (filter-out-endpoints participants sender receiver))
+    (viable-routes (map-find-route intermediaries sender receiver amount (list)))
+  )
+    viable-routes
+  )
+)
+
+;; Filter out endpoints from participant list
+(define-private (filter-out-endpoints (participants (list 1000 principal)) (sender principal) (receiver principal))
+  (filter 
+    (lambda (participant) 
+      (and 
+        (not (is-eq participant sender)) 
+        (not (is-eq participant receiver))
+      )
+    ) 
+    participants
+  )
+)
+
+;; Find a route through a specific intermediary
+(define-private (map-find-route 
+  (intermediaries (list 1000 principal))
+  (sender principal)
+  (receiver principal)
+  (amount uint)
+  (acc (list 1000 (list 2 uint))))
+  
+  (foldr check-intermediary acc intermediaries sender receiver amount)
+)
+
+;; Check if an intermediary can route the payment
+(define-private (check-intermediary 
+  (intermediary principal) 
+  (acc (list 1000 (list 2 uint)))
+  (sender principal)
+  (receiver principal)
+  (amount uint))
+  
+  (let (
+    (channel1 (map-get? participant-channels { participant1: sender, participant2: intermediary }))
+    (channel2 (map-get? participant-channels { participant1: intermediary, participant2: receiver }))
+  )
+    (if (and (is-some channel1) (is-some channel2))
+      (let (
+        (channel1-id (get channel-id (unwrap-panic channel1)))
+        (channel2-id (get channel-id (unwrap-panic channel2)))
+        (channel1-data (unwrap-panic (map-get? channels { channel-id: channel1-id })))
+        (channel2-data (unwrap-panic (map-get? channels { channel-id: channel2-id })))
+        (sender-balance (if (is-eq sender (get participant1 channel1-data))
+                           (get participant1-balance channel1-data)
+                           (get participant2-balance channel1-data)))
+        (intermediary-balance (if (is-eq intermediary (get participant1 channel2-data))
+                                 (get participant1-balance channel2-data)
+                                 (get participant2-balance channel2-data)))
+      )
+        (if (and (>= sender-balance amount) (>= intermediary-balance amount))
+          (append acc (list channel1-id channel2-id))
+          acc
+        )
+      )
+      acc
+    )
+  )
+)
+
+;; Start a multi-hop payment
+(define-public (start-multi-hop-payment 
+  (receiver principal)
+  (amount uint)
+  (route (list 10 uint))
+  (secret (buff 32)))
+  
+  (let (
+    (sender tx-sender)
+    (hashlock (sha256 secret))
+    (timelock (+ block-height u144)) ;; 1 day timelock
+    (route-length (len route))
+  )
+    ;; Ensure route is valid
+    (asserts! (> route-length u0) err-invalid-route)
+    
+    ;; For a 2-hop route (through 1 intermediary), we should have 2 channels
+    (if (is-eq route-length u2)
+      ;; Route through an intermediary
+      (let (
+        (channel1-id (unwrap-panic (element-at route u0)))
+        (channel2-id (unwrap-panic (element-at route u1)))
+        (channel1 (unwrap! (map-get? channels { channel-id: channel1-id }) err-channel-not-found))
+        (channel2 (unwrap! (map-get? channels { channel-id: channel2-id }) err-channel-not-found))
+        (intermediary (find-intermediary channel1 channel2 sender receiver))
+      )
+        ;; Ensure intermediary exists
+        (asserts! (is-some intermediary) err-invalid-route)
+        
+        ;; Create first HTLC (sender -> intermediary)
+        (try! (create-htlc channel1-id (unwrap-panic intermediary) amount hashlock timelock))
+        
+        ;; Return hashlock for continuation
+        (ok { 
+          hashlock: hashlock, 
+          timelock: timelock, 
+          intermediary: (unwrap-panic intermediary),
+          first-htlc: (- (var-get next-htlc-id) u1)
+        })
+      )
+      ;; Direct route (single channel)
+      (let (
+        (channel-id (unwrap-panic (element-at route u0)))
+        (channel (unwrap! (map-get? channels { channel-id: channel-id }) err-channel-not-found))
+      )
+        ;; Ensure this is a direct channel between sender and receiver
+        (asserts! (or 
+                   (and (is-eq sender (get participant1 channel)) (is-eq receiver (get participant2 channel)))
+                   (and (is-eq sender (get participant2 channel)) (is-eq receiver (get participant1 channel)))
+                  ) 
+                  err-invalid-route)
+        
+        ;; Create HTLC
+        (try! (create-htlc channel-id receiver amount hashlock timelock))
+        
+        (ok {
+          hashlock: hashlock, 
+          timelock: timelock,
+          first-htlc: (- (var-get next-htlc-id) u1)
+        })
+      )
+    )
+  )
+)
+
+;; Helper to find the intermediary in a 2-hop route
+(define-private (find-intermediary (channel1 (tuple participant1: principal participant2: principal ...)) 
+                                  (channel2 (tuple participant1: principal participant2: principal ...))
+                                  (sender principal)
+                                  (receiver principal))
+  (let (
+    (p1-ch1 (get participant1 channel1))
+    (p2-ch1 (get participant2 channel1))
+    (p1-ch2 (get participant1 channel2))
+    (p2-ch2 (get participant2 channel2))
+  )
+    (cond
+      ;; Sender is p1 in ch1, receiver is p2 in ch2
+      ((and (is-eq sender p1-ch1) (is-eq receiver p2-ch2) (is-eq p2-ch1 p1-ch2))
+       (some p2-ch1))
+      ;; Sender is p1 in ch1, receiver is p1 in ch2
+      ((and (is-eq sender p1-ch1) (is-eq receiver p1-ch2) (is-eq p2-ch1 p2-ch2))
+       (some p2-ch1))
+      ;; Sender is p2 in ch1, receiver is p2 in ch2
+      ((and (is-eq sender p2-ch1) (is-eq receiver p2-ch2) (is-eq p1-ch1 p1-ch2))
+       (some p1-ch1))
+      ;; Sender is p2 in ch1, receiver is p1 in ch2
+      ((and (is-eq sender p2-ch1) (is-eq receiver p1-ch2) (is-eq p1-ch1 p2-ch2))
+       (some p1-ch1))
+      (else none)
+    )
+  )
+)
