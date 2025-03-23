@@ -48,3 +48,65 @@
     last-active: uint       ;; block height
   }
 )
+;; Channel structure
+(define-map channels
+  { channel-id: uint }
+  {
+    participant1: principal,
+    participant2: principal,
+    capacity: uint,
+    participant1-balance: uint,
+    participant2-balance: uint,
+    participant1-nonce: uint,
+    participant2-nonce: uint,
+    open-block: uint,
+    state: uint,
+    closing-initiated: (optional uint),
+    closing-initiator: (optional principal),
+    settle-block: (optional uint)
+  }
+)
+
+;; Channel by participants
+(define-map participant-channels
+  { participant1: principal, participant2: principal }
+  { channel-id: uint }
+)
+
+;; Hashed Time-Locked Contracts for multi-hop routing
+(define-map htlcs
+  { htlc-id: uint }
+  {
+    channel-id: uint,
+    sender: principal,
+    receiver: principal,
+    amount: uint,
+    hashlock: (buff 32),
+    timelock: uint,
+    preimage: (optional (buff 32)),
+    claimed: bool,
+    refunded: bool,
+    created-at: uint
+  }
+)
+
+;; Routing table for path finding
+(define-map routing-edges
+  { from: principal, to: principal }
+  {
+    channel-id: uint,
+    capacity: uint,
+    fee-rate: uint,
+    last-updated: uint
+  }
+)
+
+;; Balance proofs for off-chain state
+(define-map balance-proofs
+  { channel-id: uint, participant: principal }
+  {
+    nonce: uint,
+    balance: uint,
+    signature: (buff 65)
+  }
+)
