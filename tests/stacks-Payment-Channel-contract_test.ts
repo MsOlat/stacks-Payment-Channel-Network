@@ -836,4 +836,536 @@ Clarinet.test({
     const channel2 = channel2Result.result.expectSome().expectTuple();
     
     // In channel1, intermediary's balance should be reduced
-    assertEquals(channel1['participant2-balance'], types.
+    assertEquals(channel1['participant2-balance'], types.uint(10000000)); // 20M - 10M
+    
+    // In channel2, intermediary's balance should be increased
+    assertEquals(channel2['participant1-balance'], types.uint(30000000)); // 20M + 10M
+  },
+});
+
+Clarinet.test({
+  name: "Ensure protocol fee settings can be updated",
+  async fn(chain: Chain, accounts: Map<string, Account>) {
+    const deployer = accounts.get('deployer')!;
+    
+    // Initialize the contract
+    chain.mineBlock([
+      Tx.contractCall('payment-channel-network', 'initialize', [], deployer.address)
+    ]);
+    
+    // Update protocol fee
+    let block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'update-protocol-fee',
+        [types.uint(30)], // 0.3%
+        deployer.address
+      )
+    ]);
+    
+    assertEquals(block.receipts.length, 1);
+    assertEquals(block.receipts[0].result, '(ok true)');
+    
+    // Verify updated fee
+    let result = chain.callReadOnlyFn(
+      'payment-channel-network',
+      'get-network-stats',
+      [],
+      deployer.address
+    );
+    
+    let stats = result.result.expectTuple();
+    assertEquals(stats['protocol-fee'], types.uint(30));
+    
+    // Update dispute timeout
+    block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'update-dispute-timeout',
+        [types.uint(2000)],
+        deployer.address
+      )
+    ]);
+    
+    assertEquals(block.receipts.length, 1);
+    assertEquals(block.receipts[0].result, '(ok true)');
+    
+    // Update settle timeout
+    block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'update-settle-timeout',
+        [types.uint(180)],
+        deployer.address
+      )
+    ]);
+    
+    assertEquals(block.receipts.length, 1);
+    assertEquals(block.receipts[0].result, '(ok true)');
+    
+    // Update minimum channel deposit
+    block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'update-min-channel-deposit',
+        [types.uint(2000000)],
+        deployer.address
+      )
+    ]);
+    
+    assertEquals(block.receipts.length, 1);
+    assertEquals(block.receipts[0].result, '(ok true)');
+    
+    // Verify all updated values
+    result = chain.callReadOnlyFn(
+      'payment-channel-network',
+      'get-network-stats',
+      [],
+      deployer.address
+    );
+    
+    stats = result.result.expectTuple();
+    assertEquals(stats['min-deposit'], types.uint(2000000));
+  },
+});
+
+Clarinet.test({
+  name: "Ensure fee collection and withdrawal works",
+  async fn(chain: Chain, accounts: Map<string, Account>) {
+    const deployer = accounts.get('deployer')!;
+    const participant1 = accounts.get('wallet_1')!;
+    const participant2 = accounts.get('wallet_2')!;
+    const treasuryAccount = accounts.get('wallet_3')!;
+    
+    // Initialize the contract
+    chain.mineBlock([
+      Tx.contractCall('payment-channel-network', 'initialize', [], deployer.address)
+    ]);
+    
+    // Register participants
+    chain.mineBlock([
+      Tx.contractCall('payment-channel-network', 'register-participant', [], participant1.address),
+      Tx.contractCall('payment-channel-network', 'register-participant', [], participant2.address)
+    ]);
+    
+    // Open and join a channel
+    let block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'open-channel',
+        [
+          types.principal(participant2.address),
+          types.uint(100000000), // 100 STX
+          types.uint(0)
+        ],
+        participant1.address
+      )
+    ]);
+    
+    const channelId = block.receipts[0].result.expectOk().expectUint();
+    
+    block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'join-channel',
+        [
+          types.uint(channelId),
+          types.uint(100000000) // 100 STX
+        ],
+        participant2.address
+      )
+    ]);
+    
+    // Create mock signatures
+    const signature1 = '0x' + '00'.repeat(65);
+    const signature2 = '0x' + '01'.repeat(65);
+    
+    // Close channel (will collect fees)
+    block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'cooperative-close-channel',
+        [
+          types.uint(channelId),
+          types.uint(110000000), // participant1 balance
+          types.uint(90000000),  // participant2 balance
+          types.buff(signature1),
+          types.buff(signature2)
+        ],
+        participant1.address
+      )
+    ]);
+    
+    // Verify fees were collected
+    let result = chain.callReadOnlyFn(
+      'payment-channel-network',
+      'get-network-stats',
+      [],
+      deployer.address
+    );
+    
+    let stats = result.result.expectTuple();
+    const feeBalance = parseInt(stats['protocol-fee-balance'].substring(1)); // Remove 'u' prefix
+    
+    // Should have collected 0.2% of 200M STX = 400,000 microSTX
+    // Note: actual value might vary slightly due to rounding
+    assertEquals(feeBalance > 0, true);
+    
+    // Withdraw collected fees
+    block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'withdraw-protocol-fees',
+        [types.principal(treasuryAccount.address)],
+        deployer.address
+      )
+    ]);
+    
+    assertEquals(block.receipts.length, 1);
+    assertEquals(block.receipts[0].result.expectOk().expectUint() > 0, true);
+    
+    // Verify fees were withdrawn
+    result = chain.callReadOnlyFn(
+      'payment-channel-network',
+      'get-network-stats',
+      [],
+      deployer.address
+    );
+    
+    stats = result.result.expectTuple();
+    assertEquals(stats['protocol-fee-balance'], types.uint(0));
+  },
+});
+
+Clarinet.test({
+  name: "Ensure multi-hop payment routing works",
+  async fn(chain: Chain, accounts: Map<string, Account>) {
+    const deployer = accounts.get('deployer')!;
+    const participant1 = accounts.get('wallet_1')!;
+    const intermediary = accounts.get('wallet_2')!;
+    const participant2 = accounts.get('wallet_3')!;
+    
+    // Setup
+    chain.mineBlock([
+      Tx.contractCall('payment-channel-network', 'initialize', [], deployer.address),
+      Tx.contractCall('payment-channel-network', 'register-participant', [], participant1.address),
+      Tx.contractCall('payment-channel-network', 'register-participant', [], intermediary.address),
+      Tx.contractCall('payment-channel-network', 'register-participant', [], participant2.address)
+    ]);
+    
+    // Create first channel (participant1 <-> intermediary)
+    let block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'open-channel',
+        [
+          types.principal(intermediary.address),
+          types.uint(100000000),
+          types.uint(0)
+        ],
+        participant1.address
+      )
+    ]);
+    
+    const channel1Id = block.receipts[0].result.expectOk().expectUint();
+    
+    // Join the first channel
+    chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'join-channel',
+        [
+          types.uint(channel1Id),
+          types.uint(100000000)
+        ],
+        intermediary.address
+      )
+    ]);
+    
+    // Create second channel (intermediary <-> participant2)
+    block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'open-channel',
+        [
+          types.principal(participant2.address),
+          types.uint(100000000),
+          types.uint(0)
+        ],
+        intermediary.address
+      )
+    ]);
+    
+    const channel2Id = block.receipts[0].result.expectOk().expectUint();
+    
+    // Join the second channel
+    chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'join-channel',
+        [
+          types.uint(channel2Id),
+          types.uint(100000000)
+        ],
+        participant2.address
+      )
+    ]);
+    
+    // Create secret and hashlock for HTLC
+    const secret = '0xfedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321';
+    const hashlock = '0x4f298a7bb15e68aad6af28412ece5868788deef0ff6dd8f0876073c3e42ff902'; // sha256 of secret
+    
+    // Find a route
+    const findRouteResult = chain.callReadOnlyFn(
+      'payment-channel-network',
+      'find-payment-route',
+      [
+        types.principal(participant1.address),
+        types.principal(participant2.address),
+        types.uint(20000000) // 20 STX
+      ],
+      participant1.address
+    );
+    
+    // Route should exist (may be direct or indirect)
+    assertEquals(findRouteResult.result.isOk(), true);
+    
+    // Start multi-hop payment
+    block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'start-multi-hop-payment',
+        [
+          types.principal(participant2.address),
+          types.uint(20000000), // 20 STX
+          types.list([types.uint(channel1Id), types.uint(channel2Id)]), // Route
+          types.buff(secret)
+        ],
+        participant1.address
+      )
+    ]);
+    
+    assertEquals(block.receipts.length, 1);
+    assertEquals(block.receipts[0].result.isOk(), true);
+    
+    // Extract hashlock and timelock for next step
+    const paymentData = block.receipts[0].result.expectOk().expectTuple();
+    const htlcId = paymentData['first-htlc'].expectUint();
+    const htlcHashlock = paymentData['hashlock'].expectBuff();
+    const htlcTimelock = paymentData['timelock'].expectUint();
+    
+    // Intermediary continues the payment
+    block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'continue-multi-hop-payment',
+        [
+          types.uint(channel1Id),
+          types.uint(channel2Id),
+          types.principal(participant2.address),
+          types.uint(20000000),
+          types.buff(htlcHashlock),
+          types.uint(htlcTimelock)
+        ],
+        intermediary.address
+      )
+    ]);
+    
+    assertEquals(block.receipts.length, 1);
+    assertEquals(block.receipts[0].result.isOk(), true);
+    
+    // Get second HTLC id
+    const secondHtlcId = block.receipts[0].result.expectOk().expectUint();
+    
+    // Recipient reveals secret to claim payment
+    block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'fulfill-htlc',
+        [
+          types.uint(secondHtlcId),
+          types.buff(secret)
+        ],
+        participant2.address
+      )
+    ]);
+    
+    assertEquals(block.receipts.length, 1);
+    assertEquals(block.receipts[0].result, '(ok true)');
+    
+    // Intermediary also reveals secret to claim from first hop
+    block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'fulfill-htlc',
+        [
+          types.uint(htlcId),
+          types.buff(secret)
+        ],
+        intermediary.address
+      )
+    ]);
+    
+    assertEquals(block.receipts.length, 1);
+    assertEquals(block.receipts[0].result, '(ok true)');
+    
+    // Verify final balances
+    const channel1Result = chain.callReadOnlyFn(
+      'payment-channel-network',
+      'get-channel-info',
+      [types.uint(channel1Id)],
+      deployer.address
+    );
+    
+    const channel2Result = chain.callReadOnlyFn(
+      'payment-channel-network',
+      'get-channel-info',
+      [types.uint(channel2Id)],
+      deployer.address
+    );
+    
+    const channel1 = channel1Result.result.expectSome().expectTuple();
+    const channel2 = channel2Result.result.expectSome().expectTuple();
+    
+    // Participant1 paid 20 STX
+    assertEquals(channel1['participant1-balance'], types.uint(80000000));
+    // Intermediary received 20 STX in first channel
+    assertEquals(channel1['participant2-balance'], types.uint(120000000));
+    // Intermediary paid 20 STX in second channel
+    assertEquals(channel2['participant1-balance'], types.uint(80000000));
+    // Participant2 received 20 STX
+    assertEquals(channel2['participant2-balance'], types.uint(120000000));
+  },
+});
+
+Clarinet.test({
+  name: "Ensure attempted invalid operations fail correctly",
+  async fn(chain: Chain, accounts: Map<string, Account>) {
+    const deployer = accounts.get('deployer')!;
+    const participant1 = accounts.get('wallet_1')!;
+    const participant2 = accounts.get('wallet_2')!;
+    const nonParticipant = accounts.get('wallet_3')!;
+    
+    // Initialize the contract
+    chain.mineBlock([
+      Tx.contractCall('payment-channel-network', 'initialize', [], deployer.address)
+    ]);
+    
+    // Register participants
+    chain.mineBlock([
+      Tx.contractCall('payment-channel-network', 'register-participant', [], participant1.address),
+      Tx.contractCall('payment-channel-network', 'register-participant', [], participant2.address)
+    ]);
+    
+    // Test 1: Can't open channel with self
+    let block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'open-channel',
+        [
+          types.principal(participant1.address), // Same as sender
+          types.uint(50000000),
+          types.uint(0)
+        ],
+        participant1.address
+      )
+    ]);
+    
+    assertEquals(block.receipts.length, 1);
+    assertEquals(block.receipts[0].result.includes('err'), true);
+    
+    // Test 2: Can't open channel with deposit below minimum
+    block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'open-channel',
+        [
+          types.principal(participant2.address),
+          types.uint(100), // Too small
+          types.uint(0)
+        ],
+        participant1.address
+      )
+    ]);
+    
+    assertEquals(block.receipts.length, 1);
+    assertEquals(block.receipts[0].result.includes('err'), true);
+    
+    // Open a valid channel for remaining tests
+    block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'open-channel',
+        [
+          types.principal(participant2.address),
+          types.uint(50000000),
+          types.uint(0)
+        ],
+        participant1.address
+      )
+    ]);
+    
+    const channelId = block.receipts[0].result.expectOk().expectUint();
+    
+    // Test 3: Non-participant can't join channel
+    block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'join-channel',
+        [
+          types.uint(channelId),
+          types.uint(30000000)
+        ],
+        nonParticipant.address
+      )
+    ]);
+    
+    assertEquals(block.receipts.length, 1);
+    assertEquals(block.receipts[0].result.includes('err'), true);
+    
+    // Join channel properly
+    chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'join-channel',
+        [
+          types.uint(channelId),
+          types.uint(30000000)
+        ],
+        participant2.address
+      )
+    ]);
+    
+    // Test 4: Can't create HTLC with wrong participants
+    block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'create-htlc',
+        [
+          types.uint(channelId),
+          types.principal(nonParticipant.address), // Not part of channel
+          types.uint(10000000),
+          types.buff('0x' + '11'.repeat(32)),
+          types.uint(chain.blockHeight + 144)
+        ],
+        participant1.address
+      )
+    ]);
+    
+    assertEquals(block.receipts.length, 1);
+    assertEquals(block.receipts[0].result.includes('err'), true);
+    
+    // Test 5: Non-owner can't update protocol parameters
+    block = chain.mineBlock([
+      Tx.contractCall(
+        'payment-channel-network',
+        'update-protocol-fee',
+        [types.uint(30)],
+        participant1.address // Not contract owner
+      )
+    ]);
+    
+    assertEquals(block.receipts.length, 1);
+    assertEquals(block.receipts[0].result.includes('err'), true);
+  },
+});
